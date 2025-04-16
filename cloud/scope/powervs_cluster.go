@@ -18,6 +18,7 @@ package scope
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -34,6 +35,7 @@ import (
 	cosSession "github.com/IBM/ibm-cos-sdk-go/aws/session"
 	"github.com/IBM/ibm-cos-sdk-go/service/s3"
 	tgapiv1 "github.com/IBM/networking-go-sdk/transitgatewayapisv1"
+	"github.com/IBM/platform-services-go-sdk/globaltaggingv1"
 	"github.com/IBM/platform-services-go-sdk/resourcecontrollerv2"
 	"github.com/IBM/platform-services-go-sdk/resourcemanagerv2"
 	"github.com/IBM/vpc-go-sdk/vpcv1"
@@ -50,6 +52,7 @@ import (
 	infrav1beta2 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/v1beta2"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/authenticator"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/cos"
+	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/globaltagging"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/powervs"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/resourcecontroller"
 	"sigs.k8s.io/cluster-api-provider-ibmcloud/pkg/cloud/services/resourcemanager"
@@ -79,6 +82,7 @@ const (
 	// vpcSubnetIPAddressCount is the total IP Addresses for the subnet.
 	// Support for custom address prefixes will be added at a later time. Currently, we use the ip count for subnet creation.
 	vpcSubnetIPAddressCount int64 = 256
+	tagKey                        = "powervs.cluster.x-k8s.io-resource-owner:"
 )
 
 // PowerVSClusterScopeParams defines the input parameters used to create a new PowerVSClusterScope.
@@ -110,6 +114,7 @@ type PowerVSClusterScope struct {
 	patchHelper *patch.Helper
 
 	IBMPowerVSClient      powervs.PowerVS
+	GlobalTaggingClient   globaltagging.GlobalTagging
 	IBMVPCClient          vpc.Vpc
 	TransitGatewayClient  transitgateway.TransitGateway
 	ResourceClient        resourcecontroller.ResourceController
@@ -254,6 +259,23 @@ func NewPowerVSClusterScope(params PowerVSClusterScopeParams) (*PowerVSClusterSc
 		Authenticator: auth,
 	}
 
+	// Create Global Tagging client.
+	gtOptions := globaltagging.ServiceOptions{
+		GlobalTaggingV1Options: &globaltaggingv1.GlobalTaggingV1Options{
+			Authenticator: auth,
+		},
+	}
+
+	// Override the global tagging endpoint if provided.
+	if gtEndpoint := endpoints.FetchEndpoints(string(endpoints.GlobalTagging), params.ServiceEndpoint); gtEndpoint != "" {
+		gtOptions.URL = gtEndpoint
+		params.Logger.V(3).Info("Overriding the default global tagging endpoint", "GlobaTaggingEndpoint", gtEndpoint)
+	}
+	globalTaggingClient, err := globaltagging.NewService(gtOptions)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create global tagging client: %w", err)
+	}
+
 	rmClient, err := params.getResourceManagerClient(rcManagerOptions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create resource manager client: %w", err)
@@ -269,6 +291,7 @@ func NewPowerVSClusterScope(params PowerVSClusterScopeParams) (*PowerVSClusterSc
 		IBMPowerVSClient:      powerVSClient,
 		IBMVPCClient:          vpcClient,
 		TransitGatewayClient:  tgClient,
+		GlobalTaggingClient:   globalTaggingClient,
 		ResourceClient:        resourceClient,
 		ResourceManagerClient: rmClient,
 	}
@@ -852,10 +875,13 @@ func (s *PowerVSClusterScope) createServiceInstance() (*resourcecontrollerv2.Res
 	if zone == nil {
 		return nil, fmt.Errorf("PowerVS zone is not set")
 	}
+
+	tag := tagKey + s.Name()
 	serviceInstance, _, err := s.ResourceClient.CreateResourceInstance(&resourcecontrollerv2.CreateResourceInstanceOptions{
 		Name:           s.GetServiceName(infrav1beta2.ResourceTypeServiceInstance),
 		Target:         zone,
 		ResourceGroup:  &resourceGroupID,
+		Tags:           append(make([]string, 0), tag),
 		ResourcePlanID: ptr.To(resourcecontroller.PowerVSResourcePlanID),
 	})
 	if err != nil {
@@ -1072,6 +1098,25 @@ func (s *PowerVSClusterScope) createDHCPServer() (*string, error) {
 	return dhcpServer.ID, nil
 }
 
+// TagResource will attach a user Tag to a resource.
+func (s *PowerVSClusterScope) TagResource(tagName string, resourceCRN string) error {
+
+	tagOptions := &globaltaggingv1.AttachTagOptions{}
+	tagOptions.SetResources([]globaltaggingv1.Resource{
+		{
+			ResourceID: ptr.To(resourceCRN),
+		},
+	})
+	tagOptions.SetTagName(tagName)
+	tagOptions.SetTagType(globaltaggingv1.AttachTagOptionsTagTypeUserConst)
+
+	if _, _, err := s.GlobalTaggingClient.AttachTag(tagOptions); err != nil {
+		return fmt.Errorf("failure tagging resource: %w", err)
+	}
+
+	return nil
+}
+
 // ReconcileVPC reconciles VPC.
 func (s *PowerVSClusterScope) ReconcileVPC() (bool, error) {
 	// if VPC server id is set means the VPC is already created
@@ -1170,6 +1215,12 @@ func (s *PowerVSClusterScope) createVPC() (*string, error) {
 	vpcDetails, _, err := s.IBMVPCClient.CreateVPC(vpcOption)
 	if err != nil {
 		return nil, err
+	}
+
+	tag := tagKey + s.Name()
+
+	if err = s.TagResource(tag, *vpcDetails.CRN); err != nil {
+		fmt.Errorf("error tagging vpc: %w", err)
 	}
 
 	// set security group for vpc
@@ -1324,6 +1375,12 @@ func (s *PowerVSClusterScope) createVPCSubnet(subnet infrav1beta2.Subnet) (*stri
 	}
 	if subnetDetails == nil {
 		return nil, fmt.Errorf("create VPC subnet is nil")
+	}
+	tag := tagKey + s.Name()
+	// Add a tag to the subnet for the cluster.
+	err = s.TagResource(tag, *subnetDetails.CRN)
+	if err != nil {
+		fmt.Errorf("error failed to tag subnet %s: %w", *subnetDetails.Name, err)
 	}
 	return subnetDetails.ID, nil
 }
@@ -1542,7 +1599,19 @@ func (s *PowerVSClusterScope) createVPCSecurityGroup(spec infrav1beta2.VPCSecuri
 	if err != nil {
 		return nil, err
 	}
+	tag := tagKey + s.Name()
+	by, err := json.Marshal(securityGroup)
+	if err != nil {
+		s.Info("EEEEEEEE", err)
+	}
+
+	s.Info("WWWWWW", "tag", string(by))
+	fmt.Println("PPPPPPPPP", *securityGroup.CRN)
 	// To-Do: Add tags to VPC security group, need to implement the client for "github.com/IBM/platform-services-go-sdk/globaltaggingv1".
+	err = s.TagResource(tag, *securityGroup.CRN)
+	if err != nil {
+		fmt.Errorf("error failed to tag security group %s: %w", *securityGroup.CRN, err)
+	}
 	return securityGroup.ID, nil
 }
 
@@ -2001,6 +2070,12 @@ func (s *PowerVSClusterScope) createTransitGateway() error {
 	if err != nil {
 		return err
 	}
+	tag := tagKey + s.Name()
+
+	err = s.TagResource(tag, *tg.Crn)
+	if err != nil {
+		fmt.Errorf("error failed to tag transitGateway %s: %w", *tg.Name, err)
+	}
 
 	s.SetTransitGatewayStatus(tg.ID, ptr.To(true))
 
@@ -2217,6 +2292,12 @@ func (s *PowerVSClusterScope) createLoadBalancer(lb infrav1beta2.VPCLoadBalancer
 	if err != nil {
 		return nil, err
 	}
+
+	tag := tagKey + s.Name()
+	if err = s.TagResource(tag, *loadBalancer.CRN); err != nil {
+		fmt.Errorf("error tagging load balancer: %w", err)
+	}
+
 	lbState := infrav1beta2.VPCLoadBalancerState(*loadBalancer.ProvisioningStatus)
 	return &infrav1beta2.VPCLoadBalancerStatus{
 		ID:                loadBalancer.ID,
